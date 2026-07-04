@@ -1,0 +1,9 @@
+{
+    "name": "Volume Manager",
+    "description": "An extension that allows you to create volume presets and/or change volume for each song individually.",
+    "creator": "PlasmaTi1",
+    "repo": "PlasmaTi1/VolumeManager",
+    "branch": "main",
+    "image": "preview.png",
+    "extension": "VolumeManager.js"
+  }
