@@ -2,6 +2,7 @@
   "name": "Volume Manager",
   "description": "An extension that allows you change volume for each song individually. and/or create volume presets.",
   "main": "VolumeManager.js",
+  "version": "3.0.0",
   "readme": "README.md",
   "authors": [
     {
