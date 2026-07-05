@@ -10,6 +10,9 @@
     if (!config.presets) config.presets = [];
     if (!config.songVolumes) config.songVolumes = {};
     if (!config.albumVolumes) config.albumVolumes = {};
+    if (!config.playlistVolumes) config.playlistVolumes = {};
+    if (!config.songToPlaylistMap) config.songToPlaylistMap = {};
+    if (!config.songToPlaylistNameMap) config.songToPlaylistNameMap = {};
     if (typeof config.showNotifications === 'undefined') config.showNotifications = true;
     if (typeof config.iconSize === 'undefined') config.iconSize = 19;
     if (typeof config.guiOpacity === 'undefined') config.guiOpacity = 0.05;
@@ -66,6 +69,24 @@
         return typeof uri === 'string' && uri.startsWith("spotify:local:");
     }
 
+    function isPlainObject(val) {
+        if (typeof val !== 'object' || val === null) return false;
+        const proto = Object.getPrototypeOf(val);
+        return proto === null || proto === Object.prototype;
+    }
+
+    function withTimeout(promise, ms = 2500) {
+        return Promise.race([
+            promise,
+            new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), ms))
+        ]);
+    }
+
+    function capitalizeWord(str) {
+        if (!str) return "";
+        return str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
+    }
+
     function getSavedVolume(uri) {
         if (!uri) return -1;
         const norm = normalizeUri(uri);
@@ -110,14 +131,27 @@
     function getEffectiveVolume(track) {
         if (!track) return { vol: -1, type: null };
         
+        // Playlist override checks (takes precedent)
+        const normUri = normalizeUri(track.uri);
+        const playlistUri = config.songToPlaylistMap?.[normUri] || config.songToPlaylistMap?.[track.uri];
+        if (playlistUri) {
+            const playlistVol = config.playlistVolumes?.[playlistUri];
+            if (playlistVol !== undefined && playlistVol !== -1) {
+                const playlistName = config.songToPlaylistNameMap?.[playlistUri] || "Playlist";
+                return { vol: playlistVol, type: 'playlist', name: playlistName, uri: playlistUri };
+            }
+        }
+
+        // Album override checks
         const albumUri = track.album?.uri || track.metadata?.album_uri || "";
         if (albumUri && albumUri.startsWith("spotify:album:")) {
             const albumVol = getSavedAlbumVolume(albumUri);
-            if (albumVol !== -1) return { vol: albumVol, type: 'album' };
+            if (albumVol !== -1) return { vol: albumVol, type: 'album', uri: albumUri };
         }
 
+        // Individual song override checks
         const trackVol = getSavedVolume(track.uri);
-        if (trackVol !== -1) return { vol: trackVol, type: 'track' };
+        if (trackVol !== -1) return { vol: trackVol, type: 'track', uri: track.uri };
         
         return { vol: -1, type: null };
     }
@@ -194,12 +228,78 @@
         return { uri: null, error: "Please navigate to an album, single, EP, or playlist page." };
     }
 
+    function getPageDetails() {
+        const pageUriResult = getPageUri();
+        if (pageUriResult.error) {
+            return { error: pageUriResult.error };
+        }
+        let name = "Current Page Context";
+        const h1 = document.querySelector('main h1') || 
+                   document.querySelector('.main-view-container h1') || 
+                   document.querySelector('[role="main"] h1') || 
+                   document.querySelector('.main-entityHeader-title h1') ||
+                   document.querySelector('.main-entityHeader-title') ||
+                   document.querySelector('.x-entityHeader-title');
+        if (h1) name = h1.innerText.trim();
+        return { uri: pageUriResult.uri, type: pageUriResult.type, id: pageUriResult.id, name: name };
+    }
+
+    function getCurrentlyPlayingAlbumDetails() {
+        const track = getCurrentTrack();
+        if (!track) return { error: "No song is currently playing." };
+        const albumUri = track.album?.uri || track.metadata?.album_uri || "";
+        if (!albumUri || !albumUri.startsWith("spotify:album:")) {
+            return { error: "Currently playing item is not part of an album." };
+        }
+        const albumName = track.album?.name || track.metadata?.album_title || "Unknown Album";
+        return { uri: albumUri, type: "album", name: albumName };
+    }
+
+    async function fetchEntityName(type, id) {
+        if (!id) return null;
+        if (type === "album") {
+            try {
+                const res = await withTimeout(Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/albums/${id}`), 2500);
+                if (res && res.name) return res.name;
+            } catch (e) {
+                try {
+                    const definitions = Spicetify.GraphQL?.Definitions;
+                    const getAlbum = definitions?.getAlbum;
+                    if (getAlbum) {
+                        const res = await withTimeout(Spicetify.GraphQL.Request(getAlbum, { 
+                            uri: `spotify:album:${id}`,
+                            locale: "en",
+                            limit: 1,
+                            offset: 0 
+                        }), 2500);
+                        if (res && res.data?.album?.name) return res.data.album.name;
+                    }
+                } catch (err) {}
+            }
+        } else if (type === "playlist") {
+            try {
+                const res = await withTimeout(Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/playlists/${id}`), 2500);
+                if (res && res.name) return res.name;
+            } catch (e) {
+                try {
+                    if (Spicetify.Platform?.PlaylistAPI?.getMetadata) {
+                        const meta = await withTimeout(Spicetify.Platform.PlaylistAPI.getMetadata(`spotify:playlist:${id}`), 2500);
+                        if (meta && meta.name) return meta.name;
+                    }
+                } catch (err) {}
+            }
+        }
+        return null;
+    }
+
     function extractTracksFromGraphQL(obj, tracks = [], visited = new WeakSet()) {
         if (!obj || typeof obj !== "object") return tracks;
         if (visited.has(obj)) return tracks;
         visited.add(obj);
         
-        if (obj.uri && typeof obj.uri === "string" && obj.uri.startsWith("spotify:track:") && obj.name) {
+        const isTrackOrLocalOrEpisode = obj.uri && typeof obj.uri === "string" && (obj.uri.startsWith("spotify:track:") || obj.uri.startsWith("spotify:local:") || obj.uri.startsWith("spotify:episode:"));
+
+        if (isTrackOrLocalOrEpisode && obj.name) {
             let artistName = "";
             if (Array.isArray(obj.artists)) {
                 artistName = obj.artists.map(a => a.name || a.profile?.name || "").filter(Boolean).join(", ");
@@ -214,9 +314,19 @@
             return tracks;
         }
         
-        for (const key in obj) {
-            if (Object.prototype.hasOwnProperty.call(obj, key)) {
-                extractTracksFromGraphQL(obj[key], tracks, visited);
+        if (Array.isArray(obj)) {
+            for (const item of obj) {
+                extractTracksFromGraphQL(item, tracks, visited);
+            }
+        } else if (isPlainObject(obj)) {
+            for (const key in obj) {
+                if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                    try {
+                        extractTracksFromGraphQL(obj[key], tracks, visited);
+                    } catch (e) {
+                        // Ignore properties that throw on access
+                    }
+                }
             }
         }
         return tracks;
@@ -236,14 +346,15 @@
             
             if (type === "album") {
                 try {
-                    const { getAlbum } = Spicetify.GraphQL.Definitions;
+                    const definitions = Spicetify.GraphQL?.Definitions;
+                    const getAlbum = definitions?.getAlbum;
                     if (getAlbum) {
-                        const res = await Spicetify.GraphQL.Request(getAlbum, { 
+                        const res = await withTimeout(Spicetify.GraphQL.Request(getAlbum, { 
                             uri: `spotify:album:${id}`,
                             locale: "en",
                             limit: 100,
                             offset: 0 
-                        });
+                        }), 2500);
                         tracks = extractTracksFromGraphQL(res);
                     }
                 } catch (e) {
@@ -252,9 +363,9 @@
                 
                 if (tracks.length === 0) {
                     try {
-                        const res = await Spicetify.CosmosAsync.get(
+                        const res = await withTimeout(Spicetify.CosmosAsync.get(
                             `https://api-partner.spotify.com/pathfinder/v1/query?operationName=getAlbum&variables={"uri":"spotify:album:${id}","locale":"en","offset":0,"limit":100}`
-                        );
+                        ), 2500);
                         tracks = extractTracksFromGraphQL(res);
                     } catch (e) {
                         console.error("Pathfinder getAlbum Cosmos fetch failed, trying Web API fallback...", e);
@@ -263,7 +374,7 @@
 
                 if (tracks.length === 0) {
                     try {
-                        const res = await Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/albums/${id}/tracks?limit=100`);
+                        const res = await withTimeout(Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/albums/${id}/tracks?limit=100`), 2500);
                         if (res && res.items) {
                             tracks = res.items.map(item => ({
                                 uri: item.uri,
@@ -277,13 +388,14 @@
                 }
             } else if (type === "playlist") {
                 try {
-                    const { FetchPlaylistContents } = Spicetify.GraphQL.Definitions;
+                    const definitions = Spicetify.GraphQL?.Definitions;
+                    const FetchPlaylistContents = definitions?.FetchPlaylistContents;
                     if (FetchPlaylistContents) {
-                        const res = await Spicetify.GraphQL.Request(FetchPlaylistContents, {
+                        const res = await withTimeout(Spicetify.GraphQL.Request(FetchPlaylistContents, {
                             uri: `spotify:playlist:${id}`,
                             offset: 0,
                             limit: 100
-                        });
+                        }), 2500);
                         tracks = extractTracksFromGraphQL(res);
                     }
                 } catch (e) {
@@ -293,7 +405,7 @@
                 if (tracks.length === 0) {
                     try {
                         if (Spicetify.Platform?.PlaylistAPI?.getContents) {
-                            const contents = await Spicetify.Platform.PlaylistAPI.getContents(`spotify:playlist:${id}`);
+                            const contents = await withTimeout(Spicetify.Platform.PlaylistAPI.getContents(`spotify:playlist:${id}`), 2500);
                             tracks = extractTracksFromGraphQL(contents);
                         }
                     } catch (e) {
@@ -303,9 +415,9 @@
 
                 if (tracks.length === 0) {
                     try {
-                        const res = await Spicetify.CosmosAsync.get(
+                        const res = await withTimeout(Spicetify.CosmosAsync.get(
                             `https://api-partner.spotify.com/pathfinder/v1/query?operationName=fetchPlaylistContents&variables={"uri":"spotify:playlist:${id}","offset":0,"limit":100}`
-                        );
+                        ), 2500);
                         tracks = extractTracksFromGraphQL(res);
                     } catch (e) {
                         console.error("Pathfinder fetchPlaylistContents Cosmos query failed, trying final Web API...", e);
@@ -314,7 +426,7 @@
 
                 if (tracks.length === 0) {
                     try {
-                        const res = await Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/playlists/${id}/tracks?limit=100`);
+                        const res = await withTimeout(Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/playlists/${id}/tracks?limit=100`), 2500);
                         if (res && res.items) {
                             tracks = res.items
                                 .filter(item => item && item.track)
@@ -331,7 +443,7 @@
             } else if (type === "collection") {
                 try {
                     if (Spicetify.Platform?.LibraryAPI?.getTracks) {
-                        const collection = await Spicetify.Platform.LibraryAPI.getTracks({ limit: 100 });
+                        const collection = await withTimeout(Spicetify.Platform.LibraryAPI.getTracks({ limit: 100 }), 2500);
                         tracks = extractTracksFromGraphQL(collection);
                     }
                 } catch (e) {
@@ -340,7 +452,7 @@
 
                 if (tracks.length === 0) {
                     try {
-                        const res = await Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/me/tracks?limit=100`);
+                        const res = await withTimeout(Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/me/tracks?limit=100`), 2500);
                         if (res && res.items) {
                             tracks = res.items
                                 .filter(item => item && item.track)
@@ -512,10 +624,20 @@
         }, stepTime);
     }
 
-    function throttleNotify() {
+    function throttleNotify(effective) {
         if (!enforceNotifyThrottle) {
             enforceNotifyThrottle = true;
-            notify("Custom volume locked! Delete to change volume.");
+            let msg = "Custom volume locked! Delete to change volume.";
+            if (effective) {
+                if (effective.type === 'playlist') {
+                    msg = `Custom volume locked! This song is tied to the playlist volume of "${effective.name}". Delete the volume preset for this entire playlist to change volume.`;
+                } else if (effective.type === 'album') {
+                    msg = `Custom volume locked! This song is tied to an Album Custom Volume. Delete the album volume preset to change volume.`;
+                } else if (effective.type === 'track') {
+                    msg = `Custom volume locked! Delete this track's custom volume to change volume.`;
+                }
+            }
+            notify(msg);
             setTimeout(() => { enforceNotifyThrottle = false; }, 2500);
         }
     }
@@ -529,7 +651,9 @@
                 return origSpicetifySetVolume.call(this, expectedVolume);
             }
 
-            throttleNotify(); 
+            const track = getCurrentTrack();
+            const effective = getEffectiveVolume(track);
+            throttleNotify(effective); 
             return origSpicetifySetVolume.call(this, expectedVolume);
         } else {
             if (!isAutomatedVolumeChangeActive && !isFadingUnlock) {
@@ -549,7 +673,9 @@
             if (expectedVolume !== -1) {
                 if (vol === 0) return origPlaybackSetVolume.call(this, 0); 
                 if (Math.abs(vol - expectedVolume) > 0.001) {
-                    throttleNotify();
+                    const track = getCurrentTrack();
+                    const effective = getEffectiveVolume(track);
+                    throttleNotify(effective);
                     return origPlaybackSetVolume.call(this, expectedVolume);
                 }
             } else {
@@ -618,6 +744,8 @@
                 notify(`Custom Volume: ${Math.round(effective.vol * 100)}% for this track.`);
             } else if (effective.type === 'album') {
                 notify(`Album Custom Volume: ${Math.round(effective.vol * 100)}% active.`);
+            } else if (effective.type === 'playlist') {
+                notify(`Playlist Custom Volume: ${Math.round(effective.vol * 100)}% active (tied to playlist "${effective.name}").`);
             }
         } else {
             if (expectedVolume !== -1 || isCurrentlyCustom) {
@@ -656,7 +784,7 @@
                 if (!overlay) {
                     overlay = document.createElement("div");
                     overlay.id = "vol-mgr-locked-overlay";
-                    overlay.title = "Volume slider disabled: Custom track or album volume is active.\nDelete the custom volume from the menu to unlock.";
+                    overlay.title = "Volume slider disabled: Custom track, album, or playlist volume is active.\nDelete the custom volume from the menu to unlock.";
                     overlay.style.cssText = "position: absolute; top: 0; right: 0; bottom: 0; left: 35px; z-index: 999; cursor: not-allowed;";
                     volContainer.style.position = "relative";
                     volContainer.appendChild(overlay);
@@ -725,9 +853,11 @@
         let deletingPresetIndex = -1;
         let clearAllConfirming = false;
         let resetAllConfirming = false;
+        let bulkContextSource = "playing"; // "playing" (currently playing album) or "page" (current navigation page context)
 
-        const btnStyle = "background: var(--spice-button, #1db954); color: var(--spice-text, #dedede); border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer; font-weight: bold; transition: all 0.2s;";
-        const btnGroupStyle = "background: var(--spice-button, #1db954); color: var(--spice-text, #dedede); border: none; border-left: 1px solid rgba(0,0,0,0.2); padding: 8px 10px; cursor: pointer; font-weight: bold; transition: all 0.2s;";
+        // Modified colors on primary button backgrounds to dynamically extract contrasting standard theme values
+        const btnStyle = "background: var(--spice-button, #1db954); color: var(--spice-main, #121212); border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer; font-weight: bold; transition: all 0.2s;";
+        const btnGroupStyle = "background: var(--spice-button, #1db954); color: var(--spice-main, #121212); border: none; border-left: 1px solid rgba(0,0,0,0.2); padding: 8px 10px; cursor: pointer; font-weight: bold; transition: all 0.2s;";
         const inputStyle = "background: rgba(var(--spice-rgb-selected-row), 0.1); color: var(--spice-text, #dedede); border: 1px solid var(--spice-button, #1db954); padding: 8px; border-radius: 4px;";
         const hrStyle = "border: none; border-top: 1px solid rgba(220,220,220,0.15); margin: 0;";
 
@@ -736,7 +866,7 @@
             delRowBtn.className = "del-row-btn";
             delRowBtn.innerText = "X";
             delRowBtn.title = "Delete custom volume";
-            delRowBtn.style.cssText = btnStyle + " padding: 4px 10px; background: #e22134; font-size: 0.85em; margin-left: 4px;";
+            delRowBtn.style.cssText = btnStyle + " padding: 4px 10px; background: #e22134; color: rgba(255, 255, 255, 0.9); font-size: 0.85em; margin-left: 4px;";
             delRowBtn.onclick = (event) => {
                 event.stopPropagation();
                 deleteSavedVolume(uri);
@@ -745,9 +875,9 @@
                 }
                 delRowBtn.remove();
                 saveBtn.innerText = "Save";
-                const currentGlobalVol = Math.round(Spicetify.Player.getVolume() * 100);
-                slider.value = currentGlobalVol;
-                num.value = currentGlobalVol;
+                const defaultVol = Math.round(lastGenericVolume * 100);
+                slider.value = defaultVol;
+                num.value = defaultVol;
                 
                 syncTrackVolumeUI(uri, true);
                 notify(`Removed custom volume for track.`);
@@ -766,7 +896,7 @@
                 
                 if (mainSlider && mainNum && mainSaveBtn) {
                     if (isDeleted) {
-                        const vol100 = Math.round(Spicetify.Player.getVolume() * 100);
+                        const vol100 = Math.round(lastGenericVolume * 100);
                         mainSlider.value = vol100;
                         mainNum.value = vol100;
                         mainSaveBtn.innerText = "Save Custom Vol";
@@ -784,7 +914,7 @@
                             mainDelBtn.id = "vol-mgr-curr-track-delete-btn";
                             mainDelBtn.innerText = "Delete Custom Vol";
                             mainDelBtn.title = "Remove the locked volume for this song";
-                            mainDelBtn.style.cssText = btnStyle + " background: #e22134;";
+                            mainDelBtn.style.cssText = btnStyle + " background: #e22134; color: rgba(255, 255, 255, 0.9);";
                             mainDelBtn.onclick = (e) => {
                                 e.stopPropagation();
                                 deleteSavedVolume(uri);
@@ -807,7 +937,7 @@
                 
                 if (rowSlider && rowNum && rowSaveBtn) {
                     if (isDeleted) {
-                        const vol100 = Math.round(Spicetify.Player.getVolume() * 100);
+                        const vol100 = Math.round(lastGenericVolume * 100);
                         rowSlider.value = vol100;
                         rowNum.value = vol100;
                         rowSaveBtn.innerText = "Save";
@@ -1145,7 +1275,7 @@
                     const saveBtn = document.createElement("button");
                     saveBtn.innerText = "✓ Save";
                     saveBtn.title = "Save the new preset name.";
-                    saveBtn.style.cssText = btnStyle + " padding: 4px 12px; background: #2e7d32; color: #dedede;";
+                    saveBtn.style.cssText = btnStyle + " padding: 4px 12px; background: #2e7d32; color: rgba(255, 255, 255, 0.9);";
                     saveBtn.onclick = (e) => {
                         e.stopPropagation();
                         const val = renameInput.value.trim();
@@ -1160,7 +1290,7 @@
                     const cancelBtn = document.createElement("button");
                     cancelBtn.innerText = "✗ Cancel";
                     cancelBtn.title = "Discard name change.";
-                    cancelBtn.style.cssText = btnStyle + " padding: 4px 12px; background: #c62828; color: #dedede;";
+                    cancelBtn.style.cssText = btnStyle + " padding: 4px 12px; background: #c62828; color: rgba(255, 255, 255, 0.9);";
                     cancelBtn.onclick = (e) => {
                         e.stopPropagation();
                         editingPresetIndex = -1;
@@ -1174,7 +1304,7 @@
                     const btn = document.createElement("button");
                     btn.title = `Apply preset: ${preset.name} (${Math.round(preset.vol * 100)}%)`;
                     btn.style.cssText = btnStyle + " background: var(--spice-button-active); flex-grow: 1; text-align: left; border-top-right-radius: 0; border-bottom-right-radius: 0; display: flex; justify-content: space-between; align-items: center;";
-                    btn.innerHTML = `<span>${preset.name}</span> <strong style="opacity: 0.85; color: var(--spice-text, #dedede);">${Math.round(preset.vol * 100)}%</strong>`;
+                    btn.innerHTML = `<span>${preset.name}</span> <strong style="opacity: 0.85; color: var(--spice-main, #121212);">${Math.round(preset.vol * 100)}%</strong>`;
                     btn.onclick = () => attemptApplyPreset(preset);
                     
                     const upBtn = document.createElement("button");
@@ -1221,7 +1351,7 @@
                     if (deletingPresetIndex === index) {
                         delBtn.innerText = "Confirm?";
                         delBtn.title = "Confirm deletion of this quick preset.";
-                        delBtn.style.cssText = btnGroupStyle + " background: #d32f2f; color: #dedede; border-top-right-radius: 4px; border-bottom-right-radius: 4px; font-weight: bold;";
+                        delBtn.style.cssText = btnGroupStyle + " background: #d32f2f; color: rgba(255, 255, 255, 0.9); border-top-right-radius: 4px; border-bottom-right-radius: 4px; font-weight: bold;";
                         delBtn.onclick = (e) => {
                             e.stopPropagation();
                             config.presets.splice(index, 1);
@@ -1272,19 +1402,19 @@
             presetNameInput.title = "Enter a name for the new preset";
             presetNameInput.style.cssText = inputStyle + " flex-grow: 1;";
             
-            const currentVol100 = Math.round(Spicetify.Player.getVolume() * 100);
+            const defaultVol100 = Math.round(lastGenericVolume * 100);
             
             const presetVolSlider = document.createElement("input");
             presetVolSlider.type = "range";
             presetVolSlider.min = "0"; presetVolSlider.max = "100"; presetVolSlider.step = "1";
-            presetVolSlider.value = currentVol100;
+            presetVolSlider.value = defaultVol100;
             presetVolSlider.title = "Drag to choose the preset volume";
             
             const presetVolNum = document.createElement("input");
             presetVolNum.type = "number";
             presetVolNum.min = "0"; presetVolNum.max = "100";
             presetVolNum.style.cssText = inputStyle + " width: 60px;";
-            presetVolNum.value = currentVol100;
+            presetVolNum.value = defaultVol100;
             presetVolNum.title = "Type a specific volume percentage";
 
             presetVolSlider.oninput = () => presetVolNum.value = presetVolSlider.value;
@@ -1333,7 +1463,6 @@
                 const artist = track.metadata?.artist_name || (track.artists && track.artists[0]?.name) || "Unknown Artist";
                 const albumName = track.album?.name || track.metadata?.album_title || "Unknown Album";
                 const albumUri = track.album?.uri || track.metadata?.album_uri || "";
-                const isAlbumContext = albumUri && albumUri.startsWith("spotify:album:");
 
                 const trackInfo = document.createElement("p");
                 trackInfo.innerHTML = `Currently Playing:<br><strong style="color: var(--spice-text, #dedede); font-size: 1.1em;">${title}</strong> by ${artist}<br><span style="color: var(--spice-subtext); font-size: 0.9em;">Album: ${albumName}</span>`;
@@ -1355,10 +1484,17 @@
                 trackControls.style.marginBottom = "20px";
                 trackControls.style.color = "var(--spice-text, #dedede)";
 
-                const currentVol100 = Math.round(Spicetify.Player.getVolume() * 100);
+                const defaultVol100 = Math.round(lastGenericVolume * 100);
                 const activeVol = getSavedVolume(trackUri);
                 const hasCustomVol = activeVol !== -1; 
-                let savedTrackVol = hasCustomVol ? Math.round(activeVol * 100) : currentVol100;
+                let savedTrackVol = hasCustomVol ? Math.round(activeVol * 100) : defaultVol100;
+
+                const effective = getEffectiveVolume(track);
+                const isContextVolActive = (effective.type === 'album' || effective.type === 'playlist');
+
+                if (isContextVolActive) {
+                    savedTrackVol = defaultVol100;
+                }
 
                 const trackVolSlider = document.createElement("input");
                 trackVolSlider.id = "vol-mgr-curr-track-slider";
@@ -1398,10 +1534,7 @@
                     notify("Saved and locked custom volume for this track!");
                 };
 
-                const activeAlbumVol = getSavedAlbumVolume(albumUri);
-                const hasAlbumVol = activeAlbumVol !== -1;
-
-                if (hasAlbumVol) {
+                if (isContextVolActive) {
                     trackVolSlider.disabled = true;
                     trackVolNum.disabled = true;
                     saveTrackBtn.disabled = true;
@@ -1410,7 +1543,11 @@
                     
                     const warningDiv = document.createElement("div");
                     warningDiv.style.cssText = "background: rgba(226, 33, 52, 0.1); border: 1px solid #e22134; padding: 10px 12px; border-radius: 6px; margin-bottom: 15px; color: #e22134; font-weight: bold; font-size: 0.9em;";
-                    warningDiv.innerText = "⚠️ Individual song volumes & Quick Editor are disabled because an entire Album Volume is active! Delete the Album Custom Volume below to re-enable.";
+                    if (effective.type === 'album') {
+                        warningDiv.innerText = "⚠️ Individual song volumes & Quick Editor are disabled because an entire Album Custom Volume is active! Delete the Album Custom Volume below to re-enable.";
+                    } else if (effective.type === 'playlist') {
+                        warningDiv.innerText = `⚠️ Individual song volumes & Quick Editor are disabled because a Playlist Custom Volume is active (tied to playlist "${effective.name}")! Delete the Playlist Custom Volume below to re-enable.`;
+                    }
                     trackSection.appendChild(warningDiv);
                 }
 
@@ -1422,17 +1559,12 @@
                 trackControls.appendChild(percentSpanTrack);
                 trackControls.appendChild(saveTrackBtn);
 
-                if (hasCustomVol) {
+                if (hasCustomVol && !isContextVolActive) {
                     const clearTrackBtn = document.createElement("button");
                     clearTrackBtn.id = "vol-mgr-curr-track-delete-btn";
                     clearTrackBtn.innerText = "Delete Custom Vol";
                     clearTrackBtn.title = "Remove the locked volume for this song";
-                    clearTrackBtn.style.cssText = btnStyle + " background: #e22134;";
-                    if (hasAlbumVol) {
-                        clearTrackBtn.disabled = true;
-                        clearTrackBtn.style.opacity = "0.5";
-                        clearTrackBtn.style.cursor = "not-allowed";
-                    }
+                    clearTrackBtn.style.cssText = btnStyle + " background: #e22134; color: rgba(255, 255, 255, 0.9);";
                     clearTrackBtn.onclick = (e) => {
                         e.stopPropagation();
                         deleteSavedVolume(trackUri);
@@ -1445,84 +1577,214 @@
                 }
                 trackSection.appendChild(trackControls);
 
-                if (isAlbumContext) {
-                    const hrBetween = document.createElement("hr");
-                    hrBetween.style.cssText = "border: none; border-top: 1px solid rgba(220,220,220,0.05); margin: 15px 0;";
-                    trackSection.appendChild(hrBetween);
+                const hrBetween = document.createElement("hr");
+                hrBetween.style.cssText = "border: none; border-top: 1px solid rgba(220,220,220,0.05); margin: 15px 0;";
+                trackSection.appendChild(hrBetween);
 
-                    const albumHeader = document.createElement("h3");
-                    albumHeader.innerText = "Custom Volume for Entire Album";
-                    albumHeader.style.cssText = "margin-bottom: 10px; color: var(--spice-text, #dedede);";
-                    albumHeader.title = "Lock a specific volume for the entire album.";
-                    trackSection.appendChild(albumHeader);
+                // --- Bulk Context Section ---
+                const bulkHeader = document.createElement("h3");
+                bulkHeader.innerText = "Custom Volume for Entire Context (Album / Playlist)";
+                bulkHeader.style.cssText = "margin-bottom: 10px; color: var(--spice-text, #dedede);";
+                bulkHeader.title = "Lock volume for an entire album or playlist.";
+                trackSection.appendChild(bulkHeader);
 
-                    const albumControls = document.createElement("div");
-                    albumControls.style.display = "flex";
-                    albumControls.style.gap = "10px";
-                    albumControls.style.alignItems = "center";
-                    albumControls.style.marginBottom = "20px";
-                    albumControls.style.color = "var(--spice-text, #dedede)";
+                const toggleContainer = document.createElement("div");
+                toggleContainer.style.cssText = "display: flex; gap: 10px; margin-bottom: 15px;";
 
-                    let savedAlbumVolVal = hasAlbumVol ? Math.round(activeAlbumVol * 100) : currentVol100;
+                const btnCurrentPlaying = document.createElement("button");
+                btnCurrentPlaying.innerText = "Currently Playing Song's Album";
+                btnCurrentPlaying.title = "Target the album of the currently playing track.";
 
-                    const albumVolSlider = document.createElement("input");
-                    albumVolSlider.type = "range";
-                    albumVolSlider.min = "0"; albumVolSlider.max = "100"; albumVolSlider.step = "1";
-                    albumVolSlider.value = savedAlbumVolVal;
-                    albumVolSlider.title = "Drag to choose a custom volume for this entire album";
+                const btnCurrentPage = document.createElement("button");
+                btnCurrentPage.innerText = "Current Page Context (Album/Playlist)";
+                btnCurrentPage.title = "Target the album or playlist page you are currently viewing.";
 
-                    const albumVolNum = document.createElement("input");
-                    albumVolNum.type = "number";
-                    albumVolNum.min = "0"; albumVolNum.max = "100";
-                    albumVolNum.style.cssText = inputStyle + " width: 60px;";
-                    albumVolNum.value = savedAlbumVolVal;
-                    albumVolNum.title = "Type a custom volume percentage for this entire album";
+                const updateBulkToggleStyle = () => {
+                    if (bulkContextSource === "playing") {
+                        btnCurrentPlaying.style.cssText = btnStyle + " padding: 6px 12px; background: var(--spice-button-active); font-size: 0.9em;";
+                        btnCurrentPage.style.cssText = btnStyle + " padding: 6px 12px; background: rgba(220,220,220,0.05); color: var(--spice-subtext); font-size: 0.9em;";
+                    } else {
+                        btnCurrentPlaying.style.cssText = btnStyle + " padding: 6px 12px; background: rgba(220,220,220,0.05); color: var(--spice-subtext); font-size: 0.9em;";
+                        btnCurrentPage.style.cssText = btnStyle + " padding: 6px 12px; background: var(--spice-button-active); font-size: 0.9em;";
+                    }
+                };
+                updateBulkToggleStyle();
 
-                    albumVolSlider.oninput = () => albumVolNum.value = albumVolSlider.value;
-                    albumVolNum.oninput = () => {
-                        const parsed = parseInt(albumVolNum.value);
+                btnCurrentPlaying.onclick = (e) => {
+                    e.stopPropagation();
+                    bulkContextSource = "playing";
+                    updateBulkToggleStyle();
+                    renderBulkControls();
+                };
+                btnCurrentPage.onclick = (e) => {
+                    e.stopPropagation();
+                    bulkContextSource = "page";
+                    updateBulkToggleStyle();
+                    renderBulkControls();
+                };
+
+                toggleContainer.appendChild(btnCurrentPlaying);
+                toggleContainer.appendChild(btnCurrentPage);
+                trackSection.appendChild(toggleContainer);
+
+                const bulkControlsContainer = document.createElement("div");
+                trackSection.appendChild(bulkControlsContainer);
+
+                async function renderBulkControls() {
+                    bulkControlsContainer.innerHTML = "";
+
+                    let targetUri = "";
+                    let targetType = "";
+                    let targetName = "";
+                    let errorMsg = "";
+
+                    if (bulkContextSource === "playing") {
+                        const albumDetails = getCurrentlyPlayingAlbumDetails();
+                        if (albumDetails.error) {
+                            errorMsg = albumDetails.error;
+                        } else {
+                            targetUri = albumDetails.uri;
+                            targetType = albumDetails.type;
+                            targetName = albumDetails.name;
+                        }
+                    } else {
+                        const pageDetails = getPageDetails();
+                        if (pageDetails.error) {
+                            errorMsg = pageDetails.error;
+                        } else {
+                            targetUri = pageDetails.uri;
+                            targetType = pageDetails.type;
+                            targetName = pageDetails.name;
+                            
+                            if (targetType && pageDetails.id) {
+                                fetchEntityName(targetType, pageDetails.id).then(fetchedName => {
+                                    if (fetchedName) {
+                                        targetName = fetchedName;
+                                        const nameHeader = document.getElementById("vol-mgr-target-name-header");
+                                        if (nameHeader) {
+                                            nameHeader.innerText = `${fetchedName} (${capitalizeWord(targetType)})`;
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    if (errorMsg) {
+                        const errDiv = document.createElement("div");
+                        errDiv.style.cssText = "color: #e22134; padding: 10px; font-weight: bold; border: 1px dashed rgba(226, 33, 52, 0.3); border-radius: 6px; background: rgba(226, 33, 52, 0.05); font-size: 0.9em;";
+                        errDiv.innerText = `⚠️ Target Error: ${errorMsg}`;
+                        bulkControlsContainer.appendChild(errDiv);
+                        return;
+                    }
+
+                    const infoDiv = document.createElement("div");
+                    infoDiv.style.cssText = "background: rgba(220, 220, 220, 0.02); padding: 10px; border-radius: 6px; border: 1px solid rgba(220, 220, 220, 0.05); margin-bottom: 12px;";
+                    infoDiv.innerHTML = `
+                        <div style="font-size: 0.85em; color: var(--spice-subtext); margin-bottom: 2px;">Target Context Detected:</div>
+                        <div id="vol-mgr-target-name-header" style="font-weight: bold; color: var(--spice-text, #dedede); font-size: 1.05em; margin-top: 2px;">${targetName} (${capitalizeWord(targetType)})</div>
+                    `;
+                    bulkControlsContainer.appendChild(infoDiv);
+
+                    let savedVolVal = -1;
+                    if (targetType === "album") {
+                        savedVolVal = getSavedAlbumVolume(targetUri);
+                    } else if (targetType === "playlist") {
+                        savedVolVal = config.playlistVolumes[targetUri] !== undefined ? config.playlistVolumes[targetUri] : -1;
+                    }
+
+                    const hasSavedVol = savedVolVal !== -1;
+                    const activeVol100 = hasSavedVol ? Math.round(savedVolVal * 100) : defaultVol100;
+
+                    const bulkControls = document.createElement("div");
+                    bulkControls.style.display = "flex";
+                    bulkControls.style.gap = "10px";
+                    bulkControls.style.alignItems = "center";
+                    bulkControls.style.color = "var(--spice-text, #dedede)";
+
+                    const bulkVolSlider = document.createElement("input");
+                    bulkVolSlider.type = "range";
+                    bulkVolSlider.min = "0"; bulkVolSlider.max = "100"; bulkVolSlider.step = "1";
+                    bulkVolSlider.value = activeVol100;
+                    bulkVolSlider.title = `Drag to choose volume for this ${targetType}`;
+
+                    const bulkVolNum = document.createElement("input");
+                    bulkVolNum.type = "number";
+                    bulkVolNum.min = "0"; bulkVolNum.max = "100";
+                    bulkVolNum.style.cssText = inputStyle + " width: 60px;";
+                    bulkVolNum.value = activeVol100;
+                    bulkVolNum.title = `Type volume percentage for this ${targetType}`;
+
+                    bulkVolSlider.oninput = () => bulkVolNum.value = bulkVolSlider.value;
+                    bulkVolNum.oninput = () => {
+                        const parsed = parseInt(bulkVolNum.value);
                         if (!isNaN(parsed)) {
-                            albumVolSlider.value = Math.max(0, Math.min(100, parsed));
+                            bulkVolSlider.value = Math.max(0, Math.min(100, parsed));
                         }
                     };
 
-                    const saveAlbumBtn = document.createElement("button");
-                    saveAlbumBtn.innerText = hasAlbumVol ? "Update Album Vol" : "Save Album Vol";
-                    saveAlbumBtn.title = hasAlbumVol ? "Update the locked volume for this entire album" : "Lock the current volume for this entire album";
-                    saveAlbumBtn.style.cssText = btnStyle;
-                    saveAlbumBtn.onclick = (e) => {
+                    const saveBulkBtn = document.createElement("button");
+                    saveBulkBtn.innerText = hasSavedVol ? `Update ${capitalizeWord(targetType)} Vol` : `Save ${capitalizeWord(targetType)} Vol`;
+                    saveBulkBtn.title = `Lock/update volume for this entire ${targetType}`;
+                    saveBulkBtn.style.cssText = btnStyle;
+                    saveBulkBtn.onclick = async (e) => {
                         e.stopPropagation();
-                        const newVol = parseFloat(albumVolNum.value) / 100;
-                        setSavedAlbumVolume(albumUri, newVol);
-                        applyTargetVolume(newVol, false, isLocalUri(trackUri));
+                        const newVol = parseFloat(bulkVolNum.value) / 100;
+                        
+                        saveBulkBtn.disabled = true;
+                        saveBulkBtn.innerText = "Processing...";
+                        
+                        await saveContextVolumeAction(targetUri, targetType, targetName, newVol);
+                        
+                        const currentTrack = getCurrentTrack();
+                        if (currentTrack) {
+                            const effective = getEffectiveVolume(currentTrack);
+                            if (effective.vol !== -1) {
+                                applyTargetVolume(effective.vol, false, isLocalUri(currentTrack.uri));
+                            }
+                        }
+                        
                         setTimeout(updateAllUI, 10);
-                        notify("Saved and locked custom volume for this album!");
+                        notify(`Saved and locked custom volume for the ${targetType} "${targetName}"!`);
                     };
 
-                    albumControls.appendChild(albumVolSlider);
-                    albumControls.appendChild(albumVolNum);
-                    const percentSpanAlbum = document.createElement("span");
-                    percentSpanAlbum.innerText = "%";
-                    percentSpanAlbum.style.color = "var(--spice-text, #dedede)";
-                    albumControls.appendChild(percentSpanAlbum);
-                    albumControls.appendChild(saveAlbumBtn);
+                    bulkControls.appendChild(bulkVolSlider);
+                    bulkControls.appendChild(bulkVolNum);
+                    const percentSpan = document.createElement("span");
+                    percentSpan.innerText = "%";
+                    percentSpan.style.color = "var(--spice-text, #dedede)";
+                    bulkControls.appendChild(percentSpan);
+                    bulkControls.appendChild(saveBulkBtn);
 
-                    if (hasAlbumVol) {
-                        const clearAlbumBtn = document.createElement("button");
-                        clearAlbumBtn.innerText = "Delete Album Vol";
-                        clearAlbumBtn.title = "Remove the locked volume for this album";
-                        clearAlbumBtn.style.cssText = btnStyle + " background: #e22134;";
-                        clearAlbumBtn.onclick = (e) => {
+                    if (hasSavedVol) {
+                        const deleteBulkBtn = document.createElement("button");
+                        deleteBulkBtn.innerText = `Delete ${capitalizeWord(targetType)} Vol`;
+                        deleteBulkBtn.title = `Remove the custom volume locked on this entire ${targetType}`;
+                        deleteBulkBtn.style.cssText = btnStyle + " background: #e22134; color: rgba(255, 255, 255, 0.9);";
+                        deleteBulkBtn.onclick = (e) => {
                             e.stopPropagation();
-                            deleteSavedAlbumVolume(albumUri);
-                            applyTargetVolume(lastGenericVolume, true, isLocalUri(trackUri));
+                            deleteContextVolumeAction(targetUri, targetType);
+                            
+                            const currentTrack = getCurrentTrack();
+                            if (currentTrack) {
+                                const effective = getEffectiveVolume(currentTrack);
+                                if (effective.vol !== -1) {
+                                    applyTargetVolume(effective.vol, false, isLocalUri(currentTrack.uri));
+                                } else {
+                                    applyTargetVolume(lastGenericVolume, true, isLocalUri(currentTrack.uri));
+                                }
+                            }
+                            
                             setTimeout(updateAllUI, 10);
-                            notify("Removed album custom volume! Restored normal volume.");
+                            notify(`Removed custom volume for the ${targetType} "${targetName}".`);
                         };
-                        albumControls.appendChild(clearAlbumBtn);
+                        bulkControls.appendChild(deleteBulkBtn);
                     }
-                    trackSection.appendChild(albumControls);
+
+                    bulkControlsContainer.appendChild(bulkControls);
                 }
+
+                renderBulkControls();
 
                 const hrBetweenDropdown = document.createElement("hr");
                 hrBetweenDropdown.style.cssText = "border: none; border-top: 1px solid rgba(220,220,220,0.05); margin: 15px 0;";
@@ -1540,8 +1802,8 @@
                 arrow.style.transition = "transform 0.2s ease";
                 arrow.style.color = "var(--spice-text, #dedede)";
                 
-                if (hasAlbumVol) {
-                    summary.innerText = "📋 Quick Track Volume Editor (Disabled - Album Vol Active)";
+                if (isContextVolActive) {
+                    summary.innerText = "📋 Quick Track Volume Editor (Disabled - Context Vol Active)";
                     summary.style.pointerEvents = "none";
                     summary.style.opacity = "0.5";
                     details.style.opacity = "0.6";
@@ -1581,7 +1843,7 @@
 
                     const listContainer = document.createElement("div");
                     listContainer.id = "context-tracks-container";
-                    listContainer.style.cssText = "margin-top: 15px; display: flex; flex-direction: column; gap: 10px; max-height: 350px; overflow-y: auto; padding-right: 5px;";
+                    listContainer.style.cssText = "margin-top: 15px; display: flex; flex-direction: column; gap: 10px; max-height: 350px; overflow-y: auto; padding-right: 5px; transition: opacity 0.15s ease-in-out;";
                     listContainer.innerHTML = `<span style="color: var(--spice-subtext);">Click to expand and load tracks...</span>`;
 
                     const renderFetchedTracks = (tracks) => {
@@ -1605,7 +1867,7 @@
 
                             const trackVol = getSavedVolume(t.uri);
                             const hasCustom = trackVol !== -1;
-                            const activeVol100 = hasCustom ? Math.round(trackVol * 100) : Math.round(Spicetify.Player.getVolume() * 100);
+                            const activeVol100 = hasCustom ? Math.round(trackVol * 100) : defaultVol100;
 
                             const rowControls = document.createElement("div");
                             rowControls.className = "vol-mgr-row-controls";
@@ -1669,21 +1931,35 @@
                     };
 
                     const reloadTracksList = async () => {
-                        listContainer.innerHTML = "";
-                        if (editorSource === "playing") {
-                            listContainer.innerHTML = `<span style="color: var(--spice-subtext);">Loading tracks from currently playing context...</span>`;
-                            const contextUri = getCurrentContextUri();
-                            const tracks = await fetchContextTracks(contextUri, albumUri);
-                            renderFetchedTracks(tracks);
+                        const isPlaceholder = listContainer.innerHTML.includes("Click to expand") || listContainer.innerHTML === "";
+                        if (isPlaceholder) {
+                            listContainer.innerHTML = `<span style="color: var(--spice-subtext);">Loading tracks...</span>`;
                         } else {
-                            const pageResult = getPageUri();
-                            if (pageResult.error) {
-                                listContainer.innerHTML = `<div style="color: #e22134; padding: 10px; font-weight: bold; border: 1px dashed rgba(226, 33, 52, 0.3); border-radius: 6px; background: rgba(226, 33, 52, 0.05); font-size: 0.9em; line-height: 1.4;">⚠️ Error: ${pageResult.error}</div>`;
-                                return;
+                            listContainer.style.opacity = "0.5";
+                            listContainer.style.pointerEvents = "none";
+                        }
+                        
+                        try {
+                            let tracks = [];
+                            if (editorSource === "playing") {
+                                const contextUri = getCurrentContextUri();
+                                tracks = await fetchContextTracks(contextUri, albumUri);
+                            } else {
+                                const pageResult = getPageUri();
+                                if (pageResult.error) {
+                                    listContainer.innerHTML = `<div style="color: #e22134; padding: 10px; font-weight: bold; border: 1px dashed rgba(226, 33, 52, 0.3); border-radius: 6px; background: rgba(226, 33, 52, 0.05); font-size: 0.9em; line-height: 1.4;">⚠️ Error: ${pageResult.error}</div>`;
+                                    return;
+                                }
+                                tracks = await fetchContextTracks(pageResult.uri, pageResult.uri);
                             }
-                            listContainer.innerHTML = `<span style="color: var(--spice-subtext);">Loading tracks from current page...</span>`;
-                            const tracks = await fetchContextTracks(pageResult.uri, pageResult.uri);
+                            
                             renderFetchedTracks(tracks);
+                        } catch (err) {
+                            console.error("reloadTracksList failed:", err);
+                            listContainer.innerHTML = `<span style="color: #e22134; padding: 10px;">Failed to load tracks: ${err.message || err}</span>`;
+                        } finally {
+                            listContainer.style.opacity = "1";
+                            listContainer.style.pointerEvents = "auto";
                         }
                     };
 
@@ -1750,6 +2026,9 @@
                     if (parsed.presets && parsed.songVolumes) {
                         config = parsed;
                         if (!config.albumVolumes) config.albumVolumes = {};
+                        if (!config.playlistVolumes) config.playlistVolumes = {};
+                        if (!config.songToPlaylistMap) config.songToPlaylistMap = {};
+                        if (!config.songToPlaylistNameMap) config.songToPlaylistNameMap = {};
                         saveConfig();
                         setTimeout(updateAllUI, 10);
                         notify("Backup imported successfully!");
@@ -1789,13 +2068,16 @@
             resetBtn.title = "Permanently clear and reset all of your presets and custom song volumes.";
             if (resetAllConfirming) {
                 resetBtn.innerText = "⚠️ CONFIRM FULL RESET (CANNOT BE UNDONE)";
-                resetBtn.style.cssText = btnStyle + " background: #d32f2f; color: #dedede; margin-left: auto;";
+                resetBtn.style.cssText = btnStyle + " background: #d32f2f; color: rgba(255, 255, 255, 0.9); margin-left: auto;";
                 resetBtn.onclick = (e) => {
                     e.stopPropagation();
                     config = { 
                         presets: [], 
                         songVolumes: {}, 
                         albumVolumes: {},
+                        playlistVolumes: {},
+                        songToPlaylistMap: {},
+                        songToPlaylistNameMap: {},
                         showNotifications: config.showNotifications, 
                         lastGenericVolume: lastGenericVolume, 
                         iconSize: config.iconSize, 
@@ -1876,9 +2158,15 @@
                 const warningDiv = document.createElement('div');
                 warningDiv.style.cssText = "background: rgba(226, 33, 52, 0.1); border: 1px solid #e22134; padding: 10px 12px; border-radius: 6px; text-align: center; margin-bottom: 5px;";
                 
-                const typeText = effective.type === 'album' ? 'Album Custom Volume' : 'Custom Volume';
+                let typeText = 'Custom Volume';
+                if (effective.type === 'album') {
+                    typeText = 'Album Custom Volume';
+                } else if (effective.type === 'playlist') {
+                    typeText = `Playlist Volume ("${effective.name}")`;
+                }
+                
                 warningDiv.innerHTML = `<div style="color: #e22134; font-weight: bold; font-size: 0.9em; margin-bottom: 5px;">${typeText} Active (${Math.round(effective.vol * 100)}%)</div>
-                                        <div style="color: var(--spice-subtext); font-size: 0.8em;">Delete to change volume</div>`;
+                                        <div style="color: var(--spice-subtext); font-size: 0.85em;">Delete context preset to change volume</div>`;
                 
                 hoverMenu.appendChild(warningDiv);
             }
@@ -1908,7 +2196,7 @@
 
         const openGuiBtn = document.createElement('button');
         openGuiBtn.innerText = "⚙️ Open Full Menu";
-        openGuiBtn.style.cssText = "background: var(--spice-button); color: var(--spice-text, #dedede); border: none; padding: 6px; border-radius: 4px; cursor: pointer; margin-top: 5px; font-weight: bold;";
+        openGuiBtn.style.cssText = "background: var(--spice-button); color: var(--spice-main, #121212); border: none; padding: 6px; border-radius: 4px; cursor: pointer; margin-top: 5px; font-weight: bold;";
         openGuiBtn.onclick = () => {
             hoverMenu.style.display = "none";
             openGUI();
